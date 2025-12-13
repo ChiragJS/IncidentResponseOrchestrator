@@ -1,0 +1,27 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-policy-engine
+  labels:
+    app: policy-engine
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app: policy-engine
+  template:
+    metadata:
+      labels:
+        app: policy-engine
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+        - name: policy-engine
+          image: "{{ .Values.services.policyEngine.image }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - name: KAFKA_BROKER
+              value: "{{ .Release.Name }}-kafka:9092"

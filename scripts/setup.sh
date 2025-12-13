@@ -54,7 +54,7 @@ start_infra() {
     echo "Step 2: Starting infrastructure..."
     
     cd "$PROJECT_ROOT/deploy"
-    docker compose up -d --build
+    docker compose -f docker-compose.yml -f docker-compose.local.yml up -d --build
     
     echo "  Waiting for services to be healthy..."
     sleep 15

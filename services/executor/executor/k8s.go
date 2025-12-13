@@ -12,6 +12,7 @@ import (
 	"go.uber.org/zap"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/util/homedir"
 )
@@ -26,17 +27,22 @@ func InitK8sClient() {
 		kubeconfig = os.Getenv("KUBECONFIG")
 	}
 
-	// Try to build config from flags
+	// Try to build config from flags (local dev)
 	config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
 	if err != nil {
-		logger.Log.Warn("Failed to load kubeconfig (running in-cluster or input required?)", zap.Error(err))
-		return
+		// Fallback to in-cluster config (pod)
+		config, err = rest.InClusterConfig()
+		if err != nil {
+			logger.Log.Warn("Failed to load kubeconfig (both local and in-cluster failed)", zap.Error(err))
+			return
+		}
 	}
 
 	Clientset, err = kubernetes.NewForConfig(config)
 	if err != nil {
 		logger.Log.Fatal("Failed to create k8s client", zap.Error(err))
 	}
+	logger.Log.Info("K8s client initialized successfully")
 }
 
 func RestartPod(target string, params map[string]string) error {

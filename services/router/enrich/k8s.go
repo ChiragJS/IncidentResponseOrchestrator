@@ -10,6 +10,7 @@ import (
 	"go.uber.org/zap"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/util/homedir"
 )
@@ -26,8 +27,12 @@ func InitK8sClient() {
 
 	config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
 	if err != nil {
-		logger.Log.Warn("K8s client init failed (enrichment will be limited)", zap.Error(err))
-		return
+		// Fallback to in-cluster config
+		config, err = rest.InClusterConfig()
+		if err != nil {
+			logger.Log.Warn("K8s client init failed (enrichment will be limited)", zap.Error(err))
+			return
+		}
 	}
 
 	clientset, err = kubernetes.NewForConfig(config)

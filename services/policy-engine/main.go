@@ -1,15 +1,16 @@
 package main
 
 import (
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 
-	"github.com/ChiragJS/IncidentResponseOrchestrator/services/policy-engine/policy"
-
 	"github.com/ChiragJS/IncidentResponseOrchestrator/pkg/events"
 	"github.com/ChiragJS/IncidentResponseOrchestrator/pkg/logger"
+	"github.com/ChiragJS/IncidentResponseOrchestrator/services/policy-engine/policy"
 	"github.com/confluentinc/confluent-kafka-go/kafka"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/encoding/protojson"
 )
@@ -24,7 +25,15 @@ func main() {
 	logger.InitLogger()
 	logger.Log.Info("Starting Policy Engine Service...")
 
+	// Start metrics server on port 9090
+	go func() {
+		http.Handle("/metrics", promhttp.Handler())
+		logger.Log.Info("Metrics server listening on :9090")
+		http.ListenAndServe(":9090", nil)
+	}()
+
 	kafkaBroker := os.Getenv("KAFKA_BROKER")
+
 	if kafkaBroker == "" {
 		kafkaBroker = "localhost:9092"
 	}

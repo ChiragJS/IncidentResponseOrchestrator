@@ -1,26 +1,55 @@
 replicaCount: 1
 
 image:
-  repository: orchestrator
   pullPolicy: IfNotPresent
   tag: "latest"
 
-kafka:
-  broker: "kafka:9092"
+# Cluster configuration
+cluster:
+  id: "default-cluster"
 
+# Kafka configuration (embedded)
+kafka:
+  image: confluentinc/cp-kafka
+  tag: "7.5.0"
+
+# MinIO configuration (embedded)
+minio:
+  image: minio/minio
+  tag: "latest"
+
+# Qdrant configuration (embedded)
+qdrant:
+  image: qdrant/qdrant
+  tag: "latest"
+
+# Service images (Docker Hub: chirag2403)
 services:
   ingest:
-    image: ingest-service
+    image: chirag2403/iro-ingest
     port: 8080
   router:
-    image: router-service
+    image: chirag2403/iro-router
   aiAgent:
-    image: ai-agent-service
+    image: chirag2403/iro-ai-agent
   policyEngine:
-    image: policy-engine-service
+    image: chirag2403/iro-policy-engine
   executor:
-    image: executor-service
+    image: chirag2403/iro-executor
 
+# Secrets (provide via --set or external secret manager)
+secrets:
+  geminiApiKey: ""
+  minioUser: "minioadmin"
+  minioPassword: "minioadmin"
+
+# Ingress configuration
+ingress:
+  enabled: false
+  host: orchestrator.local
+  tls: false
+
+# Service configuration
 service:
   type: ClusterIP
   port: 80

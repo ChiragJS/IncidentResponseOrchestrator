@@ -1,0 +1,55 @@
+# Qdrant Vector Database
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ .Release.Name }}-qdrant
+  labels:
+    app: qdrant
+spec:
+  serviceName: {{ .Release.Name }}-qdrant
+  replicas: 1
+  selector:
+    matchLabels:
+      app: qdrant
+  template:
+    metadata:
+      labels:
+        app: qdrant
+    spec:
+      containers:
+        - name: qdrant
+          image: "{{ .Values.qdrant.image }}:{{ .Values.qdrant.tag }}"
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 6333
+              name: http
+            - containerPort: 6334
+              name: grpc
+          volumeMounts:
+            - name: storage
+              mountPath: /qdrant/storage
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 6333
+            initialDelaySeconds: 5
+            periodSeconds: 5
+      volumes:
+        - name: storage
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-qdrant
+spec:
+  type: ClusterIP
+  ports:
+    - port: 6333
+      targetPort: 6333
+      name: http
+    - port: 6334
+      targetPort: 6334
+      name: grpc
+  selector:
+    app: qdrant

@@ -1,0 +1,50 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ .Release.Name }}-init-runbooks
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-delete-policy": before-hook-creation
+  labels:
+    app: init-runbooks
+spec:
+  template:
+    metadata:
+      labels:
+        app: init-runbooks
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: ingest
+          image: "{{ .Values.services.aiAgent.image }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["python", "/app/src/scripts/ingest_runbooks.py", "/mnt/runbooks"]
+          volumeMounts:
+            - name: runbooks
+              mountPath: /mnt/runbooks
+          env:
+            - name: MINIO_ENDPOINT
+              value: "{{ .Release.Name }}-minio:9000"
+            - name: MINIO_ROOT_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Release.Name }}-secrets
+                  key: minio-user
+            - name: MINIO_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Release.Name }}-secrets
+                  key: minio-password
+            - name: QDRANT_HOST
+              value: "{{ .Release.Name }}-qdrant"
+            - name: QDRANT_PORT
+              value: "6333"
+            - name: GEMINI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Release.Name }}-secrets
+                  key: gemini-api-key
+      volumes:
+        - name: runbooks
+          configMap:
+            name: {{ .Release.Name }}-runbooks

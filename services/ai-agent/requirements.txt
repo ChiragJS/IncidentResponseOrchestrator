@@ -4,3 +4,4 @@ google-generativeai
 confluent-kafka
 protobuf
 qdrant-client
+prometheus_client

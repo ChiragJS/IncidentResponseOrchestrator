@@ -1,0 +1,197 @@
+# Prometheus - Metrics Collection
+# Scrapes infrastructure components that expose /metrics
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-prometheus-config
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+      evaluation_interval: 15s
+    
+    # Alertmanager configuration
+    alerting:
+      alertmanagers:
+        - static_configs:
+            - targets:
+              - {{ .Release.Name }}-alertmanager:9093
+    
+    # Load alerting rules
+    rule_files:
+      - /etc/prometheus/rules.yml
+    
+    scrape_configs:
+      # Prometheus self-monitoring
+      - job_name: 'prometheus'
+        static_configs:
+          - targets: ['localhost:9090']
+      
+      # Grafana metrics
+      - job_name: 'grafana'
+        static_configs:
+          - targets: ['{{ .Release.Name }}-grafana:3000']
+      
+      # Loki metrics
+      - job_name: 'loki'
+        static_configs:
+          - targets: ['{{ .Release.Name }}-loki:3100']
+        metrics_path: /metrics
+      
+      # Promtail metrics
+      - job_name: 'promtail'
+        kubernetes_sd_configs:
+          - role: pod
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_label_app]
+            action: keep
+            regex: promtail
+          - source_labels: [__address__]
+            action: replace
+            regex: ([^:]+)(?::\d+)?
+            replacement: $1:9080
+            target_label: __address__
+      
+      # Kubernetes pods with prometheus.io/scrape annotation
+      - job_name: 'kubernetes-pods'
+        kubernetes_sd_configs:
+          - role: pod
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+            action: keep
+            regex: true
+          - source_labels: [__meta_kubernetes_namespace]
+            target_label: namespace
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+            action: replace
+            target_label: __metrics_path__
+            regex: (.+)
+          - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+            action: replace
+            regex: ([^:]+)(?::\d+)?;(\d+)
+            replacement: $1:$2
+            target_label: __address__
+  
+  rules.yml: |
+    groups:
+      - name: kubernetes-alerts
+        rules:
+          # Pod CrashLoopBackOff
+          - alert: PodCrashLooping
+            expr: rate(kube_pod_container_status_restarts_total[15m]) * 60 * 5 > 0
+            for: 5m
+            labels:
+              severity: critical
+            annotations:
+              summary: 'Pod {{`{{ $labels.pod }}`}} is crash looping'
+              description: 'Pod {{`{{ $labels.pod }}`}} in namespace {{`{{ $labels.namespace }}`}} is restarting frequently'
+          
+          # High CPU usage
+          - alert: HighCPUUsage
+            expr: sum(rate(container_cpu_usage_seconds_total[5m])) by (pod, namespace) > 0.8
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: 'High CPU usage on {{`{{ $labels.pod }}`}}'
+              description: 'Pod {{`{{ $labels.pod }}`}} in {{`{{ $labels.namespace }}`}} is using more than 80% CPU'
+          
+          # Pod not ready
+          - alert: PodNotReady
+            expr: kube_pod_status_ready{condition="false"} == 1
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: 'Pod {{`{{ $labels.pod }}`}} is not ready'
+              description: 'Pod {{`{{ $labels.pod }}`}} in namespace {{`{{ $labels.namespace }}`}} has been not ready for 5 minutes'
+          
+          # Target down (any scrape target)
+          - alert: TargetDown
+            expr: up == 0
+            for: 2m
+            labels:
+              severity: critical
+            annotations:
+              summary: 'Target {{`{{ $labels.job }}`}} is down'
+              description: 'Prometheus target {{`{{ $labels.instance }}`}} (job: {{`{{ $labels.job }}`}}) is down'
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-prometheus
+  labels:
+    app: prometheus
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prometheus
+  template:
+    metadata:
+      labels:
+        app: prometheus
+    spec:
+      serviceAccountName: {{ .Release.Name }}-prometheus
+      containers:
+        - name: prometheus
+          image: prom/prometheus:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - "--config.file=/etc/prometheus/prometheus.yml"
+            - "--storage.tsdb.path=/prometheus"
+          ports:
+            - containerPort: 9090
+          volumeMounts:
+            - name: config
+              mountPath: /etc/prometheus
+            - name: storage
+              mountPath: /prometheus
+      volumes:
+        - name: config
+          configMap:
+            name: {{ .Release.Name }}-prometheus-config
+        - name: storage
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-prometheus
+spec:
+  type: ClusterIP
+  ports:
+    - port: 9090
+      targetPort: 9090
+  selector:
+    app: prometheus
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Release.Name }}-prometheus
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ .Release.Name }}-prometheus
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "nodes", "services", "endpoints"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ .Release.Name }}-prometheus
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Release.Name }}-prometheus
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: ClusterRole
+  name: {{ .Release.Name }}-prometheus
+  apiGroup: rbac.authorization.k8s.io

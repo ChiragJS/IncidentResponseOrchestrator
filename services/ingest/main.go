@@ -3,27 +3,21 @@ package main
 import (
 	"encoding/json"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/ChiragJS/IncidentResponseOrchestrator/pkg/events"
 	"github.com/ChiragJS/IncidentResponseOrchestrator/pkg/logger"
+	"github.com/ChiragJS/IncidentResponseOrchestrator/pkg/metrics"
 	"github.com/confluentinc/confluent-kafka-go/kafka"
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
-/*
-19.73 # github.com/ChiragJS/IncidentResponseOrchestrator/services/ingest
-19.73 ./main.go:18:21: undefined: kafka.Producer
-19.73 ./main.go:26:24: undefined: kafka.NewProducer
-19.73 ./main.go:26:43: undefined: kafka.ConfigMap
-19.73 ./main.go:86:32: undefined: kafka.Message
-19.73 ./main.go:87:25: undefined: kafka.TopicPartition
-19.73 ./main.go:87:72: undefined: kafka.PartitionAny
-*/
 var producer *kafka.Producer
 var topic = "events.normalized"
 
@@ -31,9 +25,14 @@ func main() {
 	logger.InitLogger()
 	logger.Log.Info("Starting Event Ingest Service...")
 
+	kafkaBroker := os.Getenv("KAFKA_BROKER")
+	if kafkaBroker == "" {
+		kafkaBroker = "localhost:9092"
+	}
+
 	var err error
 	producer, err = kafka.NewProducer(&kafka.ConfigMap{
-		"bootstrap.servers": "kafka:29092",
+		"bootstrap.servers": kafkaBroker,
 	})
 	if err != nil {
 		logger.Log.Fatal("Failed to create Kafka producer", zap.Error(err))
@@ -42,11 +41,17 @@ func main() {
 
 	http.HandleFunc("/ingest", ingestHandler)
 	http.HandleFunc("/health", healthHandler)
+	http.Handle("/metrics", promhttp.Handler())
 
-	logger.Log.Info("Server listening on :8080")
+	logger.Log.Info("Server listening on :8080 (metrics on /metrics)")
 	if err := http.ListenAndServe(":8080", nil); err != nil {
 		logger.Log.Fatal("Server failed", zap.Error(err))
 	}
+}
+
+// recordMetrics helper to record event metrics
+func recordEventMetrics(severity string) {
+	metrics.EventsReceived.WithLabelValues("ingest", severity).Inc()
 }
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {

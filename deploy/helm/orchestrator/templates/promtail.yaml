@@ -1,0 +1,101 @@
+# Promtail - Log Collection (DaemonSet for cluster-wide logs)
+# Works on EKS, GKE, Kind, and other Kubernetes distributions
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-promtail-config
+data:
+  promtail-config.yaml: |
+    server:
+      http_listen_port: 9080
+      grpc_listen_port: 0
+    positions:
+      filename: /tmp/positions.yaml
+    clients:
+      - url: http://{{ .Release.Name }}-loki:3100/loki/api/v1/push
+    scrape_configs:
+      - job_name: pods
+        static_configs:
+          - targets:
+              - localhost
+            labels:
+              job: pods
+              __path__: /var/log/pods/*/*/*.log
+        pipeline_stages:
+          # Parse container runtime logs (CRI format used by containerd/EKS)
+          - cri: {}
+          # Extract namespace, pod, container from the filename
+          # Path format: /var/log/pods/<namespace>_<pod>_<uid>/<container>/<num>.log
+          - match:
+              selector: '{job="pods"}'
+              stages:
+                - regex:
+                    source: filename
+                    expression: '/var/log/pods/(?P<namespace>[^_]+)_(?P<pod>[^_]+)_[^/]+/(?P<container>[^/]+)/.*'
+                - labels:
+                    namespace:
+                    pod:
+                    container:
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ .Release.Name }}-promtail
+  labels:
+    app: promtail
+spec:
+  selector:
+    matchLabels:
+      app: promtail
+  template:
+    metadata:
+      labels:
+        app: promtail
+    spec:
+      serviceAccountName: {{ .Release.Name }}-promtail
+      containers:
+        - name: promtail
+          image: grafana/promtail:2.9.2
+          imagePullPolicy: IfNotPresent
+          args:
+            - "-config.file=/etc/promtail/promtail-config.yaml"
+          volumeMounts:
+            - name: config
+              mountPath: /etc/promtail
+            - name: varlogpods
+              mountPath: /var/log/pods
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: {{ .Release.Name }}-promtail-config
+        - name: varlogpods
+          hostPath:
+            path: /var/log/pods
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Release.Name }}-promtail
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ .Release.Name }}-promtail
+rules:
+  - apiGroups: [""]
+    resources: ["nodes", "nodes/proxy", "services", "endpoints", "pods"]
+    verbs: ["get", "watch", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ .Release.Name }}-promtail
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Release.Name }}-promtail
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: ClusterRole
+  name: {{ .Release.Name }}-promtail
+  apiGroup: rbac.authorization.k8s.io

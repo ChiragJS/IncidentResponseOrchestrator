@@ -1,0 +1,30 @@
+# Docker Compose Local Overlay (Kind-specific)
+# Use with: docker compose -f docker-compose.yml -f docker-compose.local.yml up -d
+#
+# This overlay is ONLY needed when:
+# 1. Using Kind cluster (which requires internal kubeconfig)
+# 2. Need to join the Kind network for container-to-K8s communication
+#
+# For other K8s clusters (EKS, GKE, minikube), the base docker-compose.yml
+# automatically mounts ~/.kube/config and should work out-of-box.
+
+services:
+  router:
+    environment:
+      CLUSTER_ID: kind-orchestrator-test
+    volumes:
+      # Override: use internal Kind kubeconfig instead of host kubeconfig
+      - ./kubeconfig:/root/.kube/config:ro
+    networks:
+      - kind
+
+  executor:
+    volumes:
+      # Override: use internal Kind kubeconfig instead of host kubeconfig  
+      - ./kubeconfig:/root/.kube/config:ro
+    networks:
+      - kind
+
+networks:
+  kind:
+    external: true

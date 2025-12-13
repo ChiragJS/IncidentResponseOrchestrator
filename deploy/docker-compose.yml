@@ -120,15 +120,14 @@ services:
       dockerfile: services/router/Dockerfile
     environment:
       KAFKA_BROKER: kafka:29092
-      CLUSTER_ID: kind-orchestrator-test
+      CLUSTER_ID: ${CLUSTER_ID:-default-cluster}
     volumes:
-      - ./kubeconfig:/root/.kube/config
+      - ${KUBECONFIG:-~/.kube/config}:/root/.kube/config:ro
     depends_on:
       kafka:
         condition: service_healthy
     networks:
       - orchestrator-net
-      - kind
 
   ai-agent:
     build:
@@ -167,19 +166,16 @@ services:
     environment:
       KAFKA_BROKER: kafka:29092
     volumes:
-      - ./kubeconfig:/root/.kube/config
+      - ${KUBECONFIG:-~/.kube/config}:/root/.kube/config:ro
     depends_on:
       kafka:
         condition: service_healthy
     networks:
       - orchestrator-net
-      - kind
 
 networks:
   orchestrator-net:
     driver: bridge
-  kind:
-    external: true
 
 volumes:
   kafka_data:

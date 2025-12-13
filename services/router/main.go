@@ -2,14 +2,17 @@ package main
 
 import (
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 
 	"github.com/ChiragJS/IncidentResponseOrchestrator/pkg/events"
 	"github.com/ChiragJS/IncidentResponseOrchestrator/pkg/logger"
+	"github.com/ChiragJS/IncidentResponseOrchestrator/pkg/metrics"
 	"github.com/ChiragJS/IncidentResponseOrchestrator/services/router/enrich"
 	"github.com/confluentinc/confluent-kafka-go/kafka"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/encoding/protojson"
 )
@@ -22,6 +25,13 @@ var (
 func main() {
 	logger.InitLogger()
 	logger.Log.Info("Starting Event Router Service...")
+
+	// Start metrics server on port 9090
+	go func() {
+		http.Handle("/metrics", promhttp.Handler())
+		logger.Log.Info("Metrics server listening on :9090")
+		http.ListenAndServe(":9090", nil)
+	}()
 
 	// Initialize K8s client for enrichment
 	enrich.InitK8sClient()
@@ -93,6 +103,7 @@ func route(ev *events.DomainEvent) {
 	val, err := protojson.Marshal(ev)
 	if err != nil {
 		logger.Log.Error("Failed to marshal domain event", zap.Error(err))
+		metrics.EventsProcessed.WithLabelValues("router", "error").Inc()
 		return
 	}
 
@@ -103,7 +114,10 @@ func route(ev *events.DomainEvent) {
 
 	if err != nil {
 		logger.Log.Error("Failed to route event", zap.String("topic", topic), zap.Error(err))
+		metrics.EventsProcessed.WithLabelValues("router", "error").Inc()
 	} else {
 		logger.Log.Info("Routed event", zap.String("topic", topic), zap.String("event_id", ev.EventId))
+		metrics.EventsProcessed.WithLabelValues("router", "success").Inc()
+		metrics.KafkaMessagesPublished.WithLabelValues(topic).Inc()
 	}
 }

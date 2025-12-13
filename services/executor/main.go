@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -11,6 +12,7 @@ import (
 	"github.com/ChiragJS/IncidentResponseOrchestrator/pkg/logger"
 	"github.com/ChiragJS/IncidentResponseOrchestrator/services/executor/executor"
 	"github.com/confluentinc/confluent-kafka-go/kafka"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -25,6 +27,13 @@ var (
 func main() {
 	logger.InitLogger()
 	logger.Log.Info("Starting Remediation Executor Service...")
+
+	// Start metrics server on port 9090
+	go func() {
+		http.Handle("/metrics", promhttp.Handler())
+		logger.Log.Info("Metrics server listening on :9090")
+		http.ListenAndServe(":9090", nil)
+	}()
 
 	executor.InitK8sClient()
 
