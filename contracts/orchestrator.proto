@@ -1,0 +1,57 @@
+syntax = "proto3";
+
+package incident.orchestrator;
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/struct.proto";
+
+option go_package = "github.com/ChiragJS/IncidentResponseOrchestrator/pkg/events";
+
+// NormalizedEvent corresponds to events.normalized
+message NormalizedEvent {
+  string event_id = 1;
+  string source = 2;
+  google.protobuf.Timestamp timestamp = 3;
+  string severity = 4;
+  google.protobuf.Struct raw_payload = 5;
+  map<string, string> metadata = 6;
+}
+
+// DomainEvent corresponds to events.k8s, events.db etc.
+message DomainEvent {
+  string event_id = 1;
+  string domain = 2; // k8s, infra, db
+  string cluster_id = 3;
+  string service_name = 4;
+  repeated string related_resources = 5;
+  google.protobuf.Struct metrics = 6;
+  NormalizedEvent original_event = 7;
+}
+
+// Decision corresponds to decisions.*
+message Decision {
+  string decision_id = 1;
+  string incident_id = 2;
+  string analysis = 3;
+  repeated Action proposed_actions = 4;
+  double confidence_score = 5;
+}
+
+// Action represents a proposed or approved action
+message Action {
+  string action_id = 1;
+  string decision_id = 2;
+  string action_type = 3;
+  string target = 4;
+  map<string, string> params = 5;
+  string reasoning = 6;
+  string approver = 7;
+}
+
+// ActionStatus corresponds to actions.status
+message ActionStatus {
+  string action_id = 1;
+  string status = 2;
+  string error = 3;
+  google.protobuf.Timestamp timestamp = 4;
+}

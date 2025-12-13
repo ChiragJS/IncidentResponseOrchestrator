@@ -1,0 +1,10 @@
+go 1.25.4
+
+use (
+	./pkg
+	./services/executor
+	./services/ingest
+	./services/policy-engine
+	./services/router
+	./tests
+)

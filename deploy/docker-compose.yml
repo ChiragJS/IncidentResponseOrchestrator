@@ -1,0 +1,188 @@
+version: '3.8'
+
+services:
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    ports:
+      - "9094:9092"
+    environment:
+      # KRaft Settings
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:29093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+
+      # POrt Mappings
+      # 29092: Internal (Broker)
+      # 29093: Internal (Controller)
+      # 9092: External (Host) - Mapped to 9094 in ports
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,CONTROLLER://0.0.0.0:29093,PLAINTEXT_HOST://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9094
+
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+
+      # Generate a random cluster ID (required for KRaft)
+      CLUSTER_ID: 'MkU3OEVBNTcwNTJENDM2Qk'
+    healthcheck:
+      test: [ "CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:29092" ]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    networks:
+      - orchestrator-net
+
+  minio:
+    image: minio/minio
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - minio_data:/data
+    networks:
+      - orchestrator-net
+
+  qdrant:
+    image: qdrant/qdrant
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    networks:
+      - orchestrator-net
+
+  prometheus:
+    image: prom/prometheus
+    ports:
+      - "9091:9090"
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    networks:
+      - orchestrator-net
+
+  grafana:
+    image: grafana/grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning
+    networks:
+      - orchestrator-net
+
+  loki:
+    image: grafana/loki:2.9.2
+    ports:
+      - "3100:3100"
+    command: -config.file=/etc/loki/local-config.yaml
+    networks:
+      - orchestrator-net
+
+  promtail:
+    image: grafana/promtail:2.9.2
+    volumes:
+      - ./promtail-config.yaml:/etc/promtail/config.yml
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: -config.file=/etc/promtail/config.yml
+    networks:
+      - orchestrator-net
+
+  ingest:
+    build:
+      context: ..
+      dockerfile: services/ingest/Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_BROKER: kafka:29092
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - orchestrator-net
+
+  router:
+    build:
+      context: ..
+      dockerfile: services/router/Dockerfile
+    environment:
+      KAFKA_BROKER: kafka:29092
+      CLUSTER_ID: kind-orchestrator-test
+    volumes:
+      - ./kubeconfig:/root/.kube/config
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - orchestrator-net
+      - kind
+
+  ai-agent:
+    build:
+      context: ..
+      dockerfile: services/ai-agent/Dockerfile
+    environment:
+      KAFKA_BROKER: kafka:29092
+      MINIO_ENDPOINT: minio:9000
+      QDRANT_HOST: qdrant
+      # CRITICAL: Pass the key here
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+    volumes:
+      - ../runbooks:/app/runbooks
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - orchestrator-net
+
+  policy-engine:
+    build:
+      context: ..
+      dockerfile: services/policy-engine/Dockerfile
+    environment:
+      KAFKA_BROKER: kafka:29092
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - orchestrator-net
+
+  executor:
+    build:
+      context: ..
+      dockerfile: services/executor/Dockerfile
+    environment:
+      KAFKA_BROKER: kafka:29092
+    volumes:
+      - ./kubeconfig:/root/.kube/config
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - orchestrator-net
+      - kind
+
+networks:
+  orchestrator-net:
+    driver: bridge
+  kind:
+    external: true
+
+volumes:
+  kafka_data:
+  minio_data:
+  qdrant_data:
+  loki_data:
