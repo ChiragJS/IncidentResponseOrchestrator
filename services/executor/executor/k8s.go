@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -165,4 +166,28 @@ func RollingRestartDeployment(target string, params map[string]string) error {
 
 	_, err = Clientset.AppsV1().Deployments(namespace).Update(context.TODO(), deploy, v1.UpdateOptions{})
 	return err
+}
+
+// RollbackDeployment performs a rollback using kubectl rollout undo
+func RollbackDeployment(target string, params map[string]string) error {
+	deploymentName := strings.TrimPrefix(target, "deployment/")
+	namespace := params["namespace"]
+	if namespace == "" {
+		namespace = "default"
+	}
+
+	logger.Log.Info("Attempting Rollback (kubectl rollout undo)",
+		zap.String("deployment", deploymentName),
+		zap.String("namespace", namespace))
+
+	// Execute kubectl command
+	cmd := exec.Command("kubectl", "rollout", "undo", "deployment/"+deploymentName, "-n", namespace)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		logger.Log.Error("Rollback failed", zap.String("output", string(output)), zap.Error(err))
+		return fmt.Errorf("kubectl rollback failed: %s (%v)", string(output), err)
+	}
+
+	logger.Log.Info("Rollback successful", zap.String("output", string(output)))
+	return nil
 }

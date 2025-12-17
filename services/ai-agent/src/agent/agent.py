@@ -1,4 +1,6 @@
 import os
+import subprocess
+import time
 import google.generativeai as genai
 from google.protobuf.json_format import MessageToJson, Parse
 from protos.contracts import orchestrator_pb2
@@ -39,25 +41,172 @@ class IncidentAgent:
             secure=False
         )
         
+        # Alert deduplication cache - prevents duplicate Gemini calls for same incident
+        self._alert_cache = {}  # {cache_key: last_processed_timestamp}
+        self._cache_ttl = 300  # 5 minutes - skip duplicate alerts within this window
+        
         print(f"Agent initialized. RAG connected to {self.qdrant_host}, Docs at {self.minio_endpoint}")
 
+    # Security whitelist - only read-only kubectl commands allowed
+    ALLOWED_COMMANDS = [
+        "kubectl get",
+        "kubectl describe",
+        "kubectl logs",
+        "kubectl top",
+    ]
+
+    # Ignore alerts from system components
+    IGNORED_SERVICE_PATTERNS = [
+        "init-runbooks",
+        "kube-state-metrics",
+        "orchestrator-",  # All orchestrator system pods
+        "prometheus",
+        "alertmanager",
+        "grafana",
+        "loki",
+        "promtail",
+        "qdrant",
+        "minio",
+        "kafka",
+    ]
+
+    def _should_ignore_alert(self, service_name):
+        """Check if this alert should be ignored (system components)."""
+        for pattern in self.IGNORED_SERVICE_PATTERNS:
+            if pattern in service_name:
+                return True
+        return False
+
     def analyze(self, event: orchestrator_pb2.DomainEvent) -> orchestrator_pb2.Decision:
+        # Filter out system component alerts
+        if self._should_ignore_alert(event.service_name):
+            print(f"IGNORED: Skipping system component alert for {event.service_name}")
+            return self._ignored_decision(event)
+        
+        # Check for duplicate alerts (rate limiting)
+        cache_key = f"{event.service_name}:{event.domain}"
+        current_time = time.time()
+        
+        if cache_key in self._alert_cache:
+            last_processed = self._alert_cache[cache_key]
+            time_since = current_time - last_processed
+            if time_since < self._cache_ttl:
+                print(f"RATE LIMIT: Skipping duplicate alert for {event.service_name} (processed {time_since:.0f}s ago, TTL={self._cache_ttl}s)")
+                return self._cached_decision(event)
+        
+        # Update cache
+        self._alert_cache[cache_key] = current_time
+        
+        # Clean up old cache entries
+        self._alert_cache = {k: v for k, v in self._alert_cache.items() 
+                            if current_time - v < self._cache_ttl * 2}
+        
+        print(f"PROCESSING: New alert for {event.service_name} (cache key: {cache_key})")
+        
         # 1. Build Context (Vector Search + MinIO Fetch)
         context = self._build_context(event)
         
-        # 2. Key Step: Prompt Engineering for SRE behavior
-        prompt = self._build_prompt(event, context)
+        # 2. PHASE 1: Ask Gemini what diagnostics to run based on runbook
+        diagnostic_commands = self._get_diagnostic_commands(event, context)
+        
+        # 3. Execute approved diagnostic commands
+        diagnostics = self._run_diagnostics(event, diagnostic_commands)
+        
+        # 4. PHASE 2: Prompt Engineering for SRE behavior with diagnostic results
+        prompt = self._build_prompt(event, context, diagnostics)
         
         try:
-            # 3. Call Gemini
+            # 5. Call Gemini for final analysis
             response = self.model.generate_content(prompt)
+            print("RATE LIMIT: Sleeping 20s after analysis API call...")
+            time.sleep(20)
             
-            # 4. Parse Structured Output (JSON)
+            # 6. Parse Structured Output (JSON)
             return self._parse_decision(response.text, event)
             
         except Exception as e:
             print(f"Gemini generation failed: {e}")
             return self._fallback_decision(event, str(e))
+
+    def _cached_decision(self, event):
+        """Return a cached/skipped decision for duplicate alerts."""
+        decision = orchestrator_pb2.Decision()
+        decision.decision_id = str(uuid.uuid4())
+        decision.incident_id = event.event_id
+        decision.analysis = f"Alert for {event.service_name} was recently processed. Skipping to prevent API rate limiting."
+        decision.confidence_score = 0.0  # Indicates no analysis was performed
+        return decision
+
+    def _ignored_decision(self, event):
+        """Return a skip decision for ignored system component alerts."""
+        decision = orchestrator_pb2.Decision()
+        decision.decision_id = str(uuid.uuid4())
+        decision.incident_id = event.event_id
+        decision.analysis = f"Alert for {event.service_name} ignored (system component)."
+        decision.confidence_score = 0.0
+        return decision
+
+    def _get_diagnostic_commands(self, event, context):
+        """PHASE 1: Ask Gemini to pick diagnostic commands from runbook."""
+        
+        # Debug: print the full metadata
+        print(f"DEBUG: event.original_event.metadata = {dict(event.original_event.metadata)}")
+        print(f"DEBUG: event.service_name = {event.service_name}")
+        
+        namespace = event.original_event.metadata.get("namespace", "default")
+        pod_name = event.original_event.metadata.get("pod", "") or event.original_event.metadata.get("service", "") or event.service_name
+        
+        print(f"DEBUG: Extracted pod_name={pod_name}, namespace={namespace}")
+        
+        prompt = f"""You are an SRE assistant. Based on the runbook and alert, output ONLY the kubectl diagnostic commands to run.
+        
+ALERT CONTEXT:
+Service: {event.service_name}
+Namespace: {namespace}
+Raw Alert: {event.original_event.raw_payload}
+
+RUNBOOK CONTENT:
+{context}
+
+INSTRUCTIONS:
+1. Suggest up to 5 read-only kubectl commands (get, describe, logs, top) to diagnose the issue.
+2. If the alert indicates a crash loop or missing pod, include commands to inspect the Deployment or ReplicaSet as well.
+3. Use the namespace '{namespace}' for all commands.
+4. Output valid JSON only.
+
+OUTPUT SCHEMA:
+{{
+    "commands": [
+        "kubectl describe pod {pod_name} -n {namespace}",
+        "kubectl logs deployment/{event.service_name} -n {namespace} --all-containers"
+    ]
+}}
+"""
+
+        try:
+            response = self.model.generate_content(prompt)
+            print("RATE LIMIT: Sleeping 20s after diagnostic API call...")
+            time.sleep(20)
+            
+            clean_json = response.text.replace("```json", "").replace("```", "").strip()
+            data = json.loads(clean_json)
+            commands = data.get("commands", [])
+            
+            # Validate against whitelist
+            validated = []
+            for cmd in commands[:5]:
+                if any(cmd.strip().startswith(allowed) for allowed in self.ALLOWED_COMMANDS):
+                    validated.append(cmd)
+                    print(f"DIAGNOSTICS: Approved command: {cmd}")
+                else:
+                    print(f"DIAGNOSTICS: BLOCKED command (not in whitelist): {cmd}")
+            
+            return validated
+            
+        except Exception as e:
+            print(f"DIAGNOSTICS: Failed to get commands from Gemini: {e}")
+            # Fallback
+            return [f"kubectl describe pod {pod_name} -n {namespace}"]
 
     def _build_context(self, event):
         try:
@@ -72,6 +221,10 @@ class IncidentAgent:
                 task_type="retrieval_query"
             )
             embedding = result['embedding']
+            
+            # Rate limit workaround
+            print("RATE LIMIT: Sleeping 20s after embedding API call...")
+            time.sleep(20)
             
             # Search Qdrant
             print("RAG: Searching Knowledge Base...")
@@ -112,7 +265,60 @@ class IncidentAgent:
             print(f"RAG Failed: {e}")
             return "Context retrieval failed."
 
-    def _build_prompt(self, event, context):
+    def _resolve_pod_name(self, name, namespace):
+        """(Deprecated) Gemini should invoke correct commands directly."""
+        return name
+
+    def _run_diagnostics(self, event, commands):
+        """Execute kubectl commands chosen by Gemini (validated against whitelist)."""
+        diagnostics = []
+        
+        print(f"DIAGNOSTICS: Executing {len(commands)} commands...")
+        
+        for cmd in commands:
+            # Double-check whitelist
+            if not any(cmd.strip().startswith(allowed) for allowed in self.ALLOWED_COMMANDS):
+                print(f"DIAGNOSTICS: BLOCKED (security): {cmd}")
+                continue
+            
+            # Directly use the command from Gemini (User Request: No replacements)
+            resolved_cmd = cmd
+            
+            try:
+                print(f"DIAGNOSTICS: Running: {resolved_cmd}")
+                
+                # Execute the command
+                result = subprocess.run(
+                    resolved_cmd.split(),
+                    capture_output=True, text=True, timeout=30
+                )
+                
+                if result.returncode == 0 and result.stdout:
+                    # Truncate long output
+                    output = result.stdout[:3000] if len(result.stdout) > 3000 else result.stdout
+                    diagnostics.append(f"=== {resolved_cmd} ===\n{output}")
+                    
+                    # Log for visibility
+                    print(f"\n--- {resolved_cmd} ---")
+                    print(output[:1500])  # Log first 1500 chars
+                    print("--- end ---\n")
+                elif result.stderr:
+                    diagnostics.append(f"=== {resolved_cmd} ===\nError: {result.stderr[:500]}")
+                    print(f"DIAGNOSTICS: Command failed: {result.stderr[:200]}")
+                    
+            except subprocess.TimeoutExpired:
+                diagnostics.append(f"=== {resolved_cmd} ===\nTimeout after 30s")
+                print(f"DIAGNOSTICS: Timeout: {resolved_cmd}")
+            except Exception as e:
+                diagnostics.append(f"=== {resolved_cmd} ===\nFailed: {e}")
+                print(f"DIAGNOSTICS: Error: {e}")
+        
+        if not diagnostics:
+            return "No diagnostic information could be gathered."
+        
+        return "\n\n".join(diagnostics)
+
+    def _build_prompt(self, event, context, diagnostics=""):
         return f"""
         You are a Senior Site Reliability Engineer (SRE). 
         Analyze the following incident and propose remediation actions.
@@ -125,12 +331,16 @@ class IncidentAgent:
         CONTEXT (RUNBOOKS):
         {context}
         
+        LIVE DIAGNOSTIC OUTPUT (kubectl commands executed):
+        {diagnostics}
+        
         RAW ALERT DATA:
         {event.original_event.raw_payload}
 
         YOUR TASK:
-        1. Identify the root cause based on the runbook and alert data.
-        2. Propose safe remediation actions.
+        1. Analyze the diagnostic output to identify the root cause.
+        2. Cross-reference with the runbook for remediation guidance.
+        3. Propose safe remediation actions.
         
         STRICT ACTION SCHEMA (YOU MUST FOLLOW THESE PARAMETERS):
         - Action: "restart_pod"
@@ -146,12 +356,12 @@ class IncidentAgent:
           Target: Deployment Name (e.g., "deployment/kafka-ingest")
           Params: {{ "namespace": "default" }}
 
-        3. Provide a confidence score (0.0 to 1.0).
+        4. Provide a confidence score (0.0 to 1.0).
 
         OUTPUT FORMAT:
         Return ONLY valid JSON matching this structure:
         {{
-            "analysis": "string explanation",
+            "analysis": "string explanation including diagnostic findings",
             "confidence_score": float,
             "proposed_actions": [
                 {{

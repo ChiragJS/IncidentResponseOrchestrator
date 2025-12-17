@@ -18,6 +18,7 @@ spec:
         prometheus.io/port: "9090"
         prometheus.io/path: "/metrics"
     spec:
+      serviceAccountName: {{ .Release.Name }}-ai-agent
       containers:
         - name: ai-agent
           image: "{{ .Values.services.aiAgent.image }}:{{ .Values.image.tag }}"
@@ -44,3 +45,39 @@ spec:
                   key: minio-password
             - name: QDRANT_HOST
               value: "{{ .Release.Name }}-qdrant"
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Release.Name }}-ai-agent
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ .Release.Name }}-ai-agent-diagnostics
+rules:
+  # Read pods and their logs for diagnostics
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list"]
+  # Read events for troubleshooting
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list"]
+  # Read deployments for context
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ .Release.Name }}-ai-agent-diagnostics
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Release.Name }}-ai-agent
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: ClusterRole
+  name: {{ .Release.Name }}-ai-agent-diagnostics
+  apiGroup: rbac.authorization.k8s.io

@@ -25,6 +25,13 @@ services:
     networks:
       - kind
 
+  ai-agent:
+    volumes:
+      # Mount kubeconfig for kubectl diagnostics
+      - ./kubeconfig:/root/.kube/config:ro
+    networks:
+      - kind
+
 networks:
   kind:
     external: true

@@ -80,6 +80,44 @@ func extractServiceName(ev *events.NormalizedEvent) string {
 			if val, ok := fields["service"]; ok {
 				return val.GetStringValue()
 			}
+			// Try inside "commonLabels" struct (AlertManager webhook format)
+			if commonLabelsVal, ok := fields["commonLabels"]; ok {
+				if commonLabelsStruct := commonLabelsVal.GetStructValue(); commonLabelsStruct != nil {
+					commonLabelsFields := commonLabelsStruct.GetFields()
+					// Try "pod" in commonLabels
+					if val, ok := commonLabelsFields["pod"]; ok {
+						return val.GetStringValue()
+					}
+				}
+			}
+			// Try inside "labels" struct (from AlertManager)
+			if labelsVal, ok := fields["labels"]; ok {
+				if labelsStruct := labelsVal.GetStructValue(); labelsStruct != nil {
+					labelsFields := labelsStruct.GetFields()
+					// Try "pod" in labels (AlertManager format)
+					if val, ok := labelsFields["pod"]; ok {
+						return val.GetStringValue()
+					}
+					// Try "service" in labels
+					if val, ok := labelsFields["service"]; ok {
+						return val.GetStringValue()
+					}
+				}
+			}
+			// Try inside "metadata" struct (from ingest API)
+			if metaVal, ok := fields["metadata"]; ok {
+				if metaStruct := metaVal.GetStructValue(); metaStruct != nil {
+					metaFields := metaStruct.GetFields()
+					// Try "service" inside metadata
+					if val, ok := metaFields["service"]; ok {
+						return val.GetStringValue()
+					}
+					// Try "pod" as fallback
+					if val, ok := metaFields["pod"]; ok {
+						return val.GetStringValue()
+					}
+				}
+			}
 		}
 	}
 	return "unknown-service"

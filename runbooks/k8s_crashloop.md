@@ -28,7 +28,7 @@
 ## Remediation Actions
 -   **Fix Config**: If "Env var missing", update the deployment/secret.
 -   **Increase Memory**: If OOMKilled, increase limits.
-    *Action*: (Requires manual YAML edit usually, or Vertical Pod Autoscaler).
--   **Restart Pod**: Sometimes a transient issue (e.g., DB not ready) causes a crash. A restart might fix it if backoff logic is poor.
-    *Action*: `restart_pod` (Target: `<pod-name>`)
--   **Rollback**: If this started after a recent deployment.
+-   **Rollback**: If this started after a recent deployment, if logs show "Fatal Error" / "Panic", OR if pods are crashing so fast they cannot be inspected (Pod Not Found).
+    *Action*: `rollback_deployment` (Target: `deployment/<deployment-name>`)
+-   **Restart Deployment**: Only for stuck/unresponsive pods that are NOT crashing repeatedly.
+    *Action*: `rolling_restart_deployment` (Target: `deployment/<deployment-name>`)

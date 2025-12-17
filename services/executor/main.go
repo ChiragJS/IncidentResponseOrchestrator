@@ -105,6 +105,8 @@ func processAction(msg *kafka.Message) {
 		errExec = executor.ScaleDeployment(action.Target, action.Params)
 	case "rolling_restart_deployment":
 		errExec = executor.RollingRestartDeployment(action.Target, action.Params)
+	case "rollback_deployment":
+		errExec = executor.RollbackDeployment(action.Target, action.Params)
 	default:
 		// In a real system we would error. Here we simulate generic success for demo.
 		errExec = executor.RestartPod(action.Target, action.Params)

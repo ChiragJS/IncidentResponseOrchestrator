@@ -71,6 +71,10 @@ func ingestHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Debug: Log the raw payload to see AlertManager structure
+	payloadBytes, _ := json.MarshalIndent(rawPayload, "", "  ")
+	logger.Log.Info("DEBUG: Received payload", zap.String("payload", string(payloadBytes)))
+
 	// Convert raw payload to Struct
 	structPayload, err := structpb.NewStruct(rawPayload)
 	if err != nil {

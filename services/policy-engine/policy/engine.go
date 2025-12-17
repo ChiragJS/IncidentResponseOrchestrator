@@ -13,6 +13,7 @@ var allowedActions = map[string]bool{
 	"restart_pod":                true,
 	"scale_deployment":           true,
 	"rolling_restart_deployment": true,
+	"rollback_deployment":        true,
 	"gather_logs":                true,
 	"flush_cache":                true,
 }
