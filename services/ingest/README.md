@@ -10,9 +10,11 @@ The Ingest Service is the entry point for all external alerts and events into th
 
 ## API Endpoints
 
-| Method | Endpoint   | Description                    |
-|--------|------------|--------------------------------|
-| POST   | `/ingest`  | Receive and queue a new alert  |
+| Method | Endpoint   | Description                     |
+|--------|------------|---------------------------------|
+| POST   | `/ingest`  | Receive and queue a new alert   |
+| GET    | `/health`  | Health check endpoint           |
+| GET    | `/metrics` | Prometheus metrics endpoint     |
 
 ### Request Format
 
@@ -37,10 +39,14 @@ The Ingest Service is the entry point for all external alerts and events into th
 ## Supported Features
 
 - [x] HTTP REST API for alert ingestion
-- [x] JSON payload parsing
-- [x] Event ID generation (UUID)
+- [x] JSON payload parsing (flexible schema)
+- [x] Event ID generation (UUID v4)
 - [x] Kafka producer integration
-- [x] Protobuf serialization
+- [x] Protobuf serialization (protojson)
+- [x] **Prometheus metrics** (`/metrics` endpoint)
+- [x] **Health check endpoint** (`/health`)
+- [x] **Debug logging** of raw payloads
+- [x] **Structured logging** with Zap
 
 ## Not Yet Implemented
 
@@ -48,17 +54,19 @@ The Ingest Service is the entry point for all external alerts and events into th
 - [ ] **Rate Limiting**: No protection against flood attacks
 - [ ] **Webhook Signatures**: No verification of Alertmanager/Prometheus webhooks
 - [ ] **Batch Ingestion**: Single event per request only
-- [ ] **Schema Validation**: No strict schema enforcement
+- [ ] **Schema Validation**: Accepts any valid JSON
 
 ## Configuration
 
-| Environment Variable | Default        | Description              |
-|---------------------|----------------|--------------------------|
-| `KAFKA_BROKER`      | `localhost:9092` | Kafka bootstrap servers |
-| `PORT`              | `8080`         | HTTP server port         |
+| Environment Variable | Default          | Description               |
+|---------------------|------------------|---------------------------|
+| `KAFKA_BROKER`      | `localhost:9092` | Kafka bootstrap servers   |
+| `PORT`              | `8080`           | HTTP server port          |
 
 ## Tech Stack
 
-- **Language**: Go
+- **Language**: Go 1.21+
 - **Framework**: Standard library `net/http`
 - **Messaging**: Kafka (confluent-kafka-go)
+- **Logging**: Zap (structured logging)
+- **Metrics**: Prometheus client

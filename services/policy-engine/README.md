@@ -4,7 +4,7 @@ The Policy Engine is the safety layer of the Incident Response Orchestrator. It 
 
 ## Responsibility
 
-- Consume decisions from `decisions.{domain}` topics
+- Consume decisions from `decisions.{domain}` topics (k8s, infra, db)
 - Evaluate each proposed action against policy rules
 - Approve or reject actions based on:
   - Action type allowlist
@@ -18,25 +18,26 @@ The Policy Engine is the safety layer of the Incident Response Orchestrator. It 
 
 Only these action types are permitted:
 
-| Allowed Actions              |
-|-----------------------------|
-| `restart_pod`               |
-| `scale_deployment`          |
-| `rolling_restart_deployment` |
-| `gather_logs`               |
-| `flush_cache`               |
+| Allowed Actions               |
+|-------------------------------|
+| `restart_pod`                 |
+| `scale_deployment`            |
+| `rolling_restart_deployment`  |
+| `rollback_deployment`         |
+| `gather_logs`                 |
+| `flush_cache`                 |
 
 Any other action type is **automatically rejected**.
 
 ### 2. Namespace Restrictions
 
-| Namespace   | Status    |
-|------------|-----------|
-| `default`  | ✅ Allowed |
-| `apps`     | ✅ Allowed |
-| `staging`  | ✅ Allowed |
-| `kube-system` | ❌ Blocked |
-| `production`  | ❌ Requires human approval |
+| Namespace     | Status                      |
+|---------------|-----------------------------|
+| `default`     | ✅ Allowed                   |
+| `apps`        | ✅ Allowed                   |
+| `staging`     | ✅ Allowed                   |
+| `kube-system` | ❌ Blocked                   |
+| `production`  | ❌ Requires human approval   |
 
 ### 3. Rate Limiting
 
@@ -44,13 +45,34 @@ Any other action type is **automatically rejected**.
 - Prevents runaway automation loops
 - In-memory tracking (resets on restart)
 
+## Architecture
+
+```mermaid
+flowchart LR
+    Kafka1[decisions.k8s] --> Policy
+    Kafka2[decisions.infra] --> Policy
+    Kafka3[decisions.db] --> Policy
+    
+    subgraph Policy["Policy Engine"]
+        AllowList[Action Allowlist]
+        Namespace[Namespace Check]
+        RateLimit[Rate Limiter]
+    end
+    
+    Policy --> Kafka4[actions.approved]
+```
+
 ## Supported Features
 
 - [x] Kafka consumer/producer integration
+- [x] **Multi-domain support** (k8s, infra, db topics)
 - [x] Action type allowlist validation
 - [x] Namespace-based access control
 - [x] In-memory rate limiting
 - [x] Detailed rejection reasons in logs
+- [x] **Auto-approver tagging** (`policy_engine_auto`)
+- [x] **Prometheus metrics** (`/metrics` on port 9090)
+- [x] **Graceful shutdown** on SIGINT/SIGTERM
 
 ## Not Yet Implemented
 
@@ -63,11 +85,13 @@ Any other action type is **automatically rejected**.
 
 ## Configuration
 
-| Environment Variable | Default        | Description              |
-|---------------------|----------------|--------------------------|
-| `KAFKA_BROKER`      | `localhost:9092` | Kafka bootstrap servers |
+| Environment Variable | Default          | Description              |
+|---------------------|------------------|--------------------------|
+| `KAFKA_BROKER`      | `localhost:9092` | Kafka bootstrap servers  |
 
 ## Tech Stack
 
-- **Language**: Go
+- **Language**: Go 1.21+
 - **Messaging**: Kafka (confluent-kafka-go)
+- **Logging**: Zap (structured logging)
+- **Metrics**: Prometheus client
