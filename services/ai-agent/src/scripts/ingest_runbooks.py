@@ -6,7 +6,7 @@ import logging
 from minio import Minio
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
-import google.generativeai as genai
+from litellm import embedding
 from pypdf import PdfReader
 
 # Setup Logging
@@ -28,7 +28,8 @@ if not GEMINI_API_KEY:
     logging.error("GEMINI_API_KEY is required")
     sys.exit(1)
 
-genai.configure(api_key=GEMINI_API_KEY)
+# Set API key for LiteLLM
+os.environ["GEMINI_API_KEY"] = GEMINI_API_KEY
 
 def init_minio():
     client = Minio(
@@ -117,18 +118,17 @@ def main():
             logging.error(f"Failed to upload {filename}: {e}")
             continue
 
-        # Generate embedding
-        result = genai.embed_content(
-            model="models/text-embedding-004",
-            content=content,
-            task_type="retrieval_document"
+        # Generate embedding using LiteLLM
+        result = embedding(
+            model="gemini/text-embedding-004",
+            input=[content[:8000]]  # Limit content size for embedding
         )
-        embedding = result['embedding']
+        emb = result.data[0]['embedding']
 
         # 3. Prepare Vector Point
         point = models.PointStruct(
             id=idx,
-            vector=embedding,
+            vector=emb,
             payload={
                 "filename": filename,
                 "minio_bucket": BUCKET_NAME,

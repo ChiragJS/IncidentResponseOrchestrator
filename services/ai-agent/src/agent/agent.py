@@ -1,7 +1,8 @@
 import os
 import subprocess
+import shlex
 import time
-import google.generativeai as genai
+import re
 from google.protobuf.json_format import MessageToJson, Parse
 from protos.contracts import orchestrator_pb2
 import uuid
@@ -9,19 +10,19 @@ import json
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
 from minio import Minio
+from llm.llm_provider import LLMProvider
+
 
 class IncidentAgent:
     def __init__(self):
-        print("Initializing Gemini Analyst...")
-        api_key = os.getenv("GEMINI_API_KEY")
-        if not api_key:
-            print("WARNING: GEMINI_API_KEY not set. Agent will fail to generate.")
+        print("Initializing AI Agent with LLM Provider...")
         
-        genai.configure(api_key=api_key)
-        # self.model = genai.GenerativeModel('gemini-2.0-flash-exp') # Using 2.0 Flash as equivalent to 2.5 request if not available, or keep generic if user insists. 
-        
-        
-        self.model = genai.GenerativeModel('gemini-2.5-flash')
+        # Initialize LLM Provider (handles rate limiting and retries internally)
+        self.llm = LLMProvider(
+            model=os.getenv("LLM_MODEL", "gemini/gemini-2.5-flash"),
+            max_retries=int(os.getenv("LLM_MAX_RETRIES", "5")),
+            rate_limit_rpm=float(os.getenv("LLM_RATE_LIMIT_RPM", "5.0")),
+        )
         
         # Initialize RAG (Qdrant)
         self.qdrant_host = os.getenv("QDRANT_HOST", "qdrant")
@@ -29,7 +30,7 @@ class IncidentAgent:
         self.collection_name = "sre_knowledge"
         
         # Initialize MinIO
-        self.minio_endpoint = os.getenv("MINIO_ENDPOINT", "minio:9000") # internal docker usage
+        self.minio_endpoint = os.getenv("MINIO_ENDPOINT", "minio:9000")
         self.minio_access = os.getenv("MINIO_ROOT_USER", "minioadmin")
         self.minio_secret = os.getenv("MINIO_ROOT_PASSWORD", "minioadmin")
         self.bucket_name = "runbooks"
@@ -41,9 +42,9 @@ class IncidentAgent:
             secure=False
         )
         
-        # Alert deduplication cache - prevents duplicate Gemini calls for same incident
-        self._alert_cache = {}  # {cache_key: last_processed_timestamp}
-        self._cache_ttl = 300  # 5 minutes - skip duplicate alerts within this window
+        # Alert deduplication cache
+        self._alert_cache = {}
+        self._cache_ttl = 300  # 5 minutes
         
         print(f"Agent initialized. RAG connected to {self.qdrant_host}, Docs at {self.minio_endpoint}")
 
@@ -59,7 +60,7 @@ class IncidentAgent:
     IGNORED_SERVICE_PATTERNS = [
         "init-runbooks",
         "kube-state-metrics",
-        "orchestrator-",  # All orchestrator system pods
+        "orchestrator-",
         "prometheus",
         "alertmanager",
         "grafana",
@@ -70,20 +71,124 @@ class IncidentAgent:
         "kafka",
     ]
 
-    def _should_ignore_alert(self, service_name):
+    def _should_ignore_alert(self, service_name: str) -> bool:
         """Check if this alert should be ignored (system components)."""
         for pattern in self.IGNORED_SERVICE_PATTERNS:
             if pattern in service_name:
                 return True
         return False
 
+    def _sanitize_input(self, value: str) -> str:
+        """Sanitize input to prevent prompt injection."""
+        if not value:
+            return ""
+        # Remove potential injection patterns
+        sanitized = re.sub(r'[;\|\&\$`]', '', str(value))
+        # Limit length
+        return sanitized[:500]
+
+    def _discover_resources(self, namespace: str) -> dict:
+        """
+        Discover actual K8s resources to provide accurate names to LLM.
+        This prevents the LLM from guessing wrong pod/deployment names.
+        """
+        resources = {
+            "pods": [],
+            "deployments": [],
+            "services": [],
+            "replicasets": []
+        }
+        
+        discovery_commands = [
+            ("pods", ["kubectl", "get", "pods", "-n", namespace, "-o", "name"]),
+            ("deployments", ["kubectl", "get", "deployments", "-n", namespace, "-o", "name"]),
+            ("services", ["kubectl", "get", "services", "-n", namespace, "-o", "name"]),
+            ("replicasets", ["kubectl", "get", "replicasets", "-n", namespace, "-o", "name"]),
+        ]
+        
+        for resource_type, cmd in discovery_commands:
+            try:
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True, 
+                    text=True, 
+                    timeout=10
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    # Parse output like "pod/myapp-abc123" -> "myapp-abc123"
+                    items = []
+                    for line in result.stdout.strip().split("\n"):
+                        if "/" in line:
+                            items.append(line.split("/", 1)[1])
+                        elif line.strip():
+                            items.append(line.strip())
+                    resources[resource_type] = items[:20]  # Limit to 20 per type
+            except subprocess.TimeoutExpired:
+                print(f"DISCOVERY: Timeout getting {resource_type}")
+            except Exception as e:
+                print(f"DISCOVERY: Failed to get {resource_type}: {e}")
+        
+        print(f"DISCOVERY: Found {len(resources['pods'])} pods, {len(resources['deployments'])} deployments in {namespace}")
+        return resources
+
+    def _find_matching_resources(self, service_name: str, resources: dict) -> dict:
+        """Find resources that match the service name from the alert."""
+        matches = {
+            "pods": [],
+            "deployments": [],
+        }
+        
+        # Normalize service name for matching
+        service_lower = service_name.lower()
+        
+        for pod in resources.get("pods", []):
+            # Match if pod name contains service name or vice versa
+            if service_lower in pod.lower() or any(part in pod.lower() for part in service_lower.split("-")):
+                matches["pods"].append(pod)
+        
+        for deploy in resources.get("deployments", []):
+            if service_lower in deploy.lower() or any(part in deploy.lower() for part in service_lower.split("-")):
+                matches["deployments"].append(deploy)
+        
+        return matches
+
+    def _extract_json(self, text: str) -> dict:
+        """
+        Robustly extract JSON from LLM response.
+        Handles markdown code blocks, trailing text, etc.
+        """
+        if not text:
+            return {}
+        
+        # Try multiple extraction methods
+        extraction_methods = [
+            # Method 1: Direct parse (already clean JSON)
+            lambda t: json.loads(t.strip()),
+            # Method 2: Extract from markdown code block
+            lambda t: json.loads(re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', t).group(1)),
+            # Method 3: Find JSON object pattern
+            lambda t: json.loads(re.search(r'\{[\s\S]*\}', t).group(0)),
+            # Method 4: Find JSON array pattern  
+            lambda t: json.loads(re.search(r'\[[\s\S]*\]', t).group(0)),
+        ]
+        
+        for method in extraction_methods:
+            try:
+                return method(text)
+            except (json.JSONDecodeError, AttributeError, TypeError):
+                continue
+        
+        print(f"JSON_EXTRACT: All extraction methods failed for: {text[:200]}...")
+        return {}
+
     def analyze(self, event: orchestrator_pb2.DomainEvent) -> orchestrator_pb2.Decision:
+        """Main analysis entry point."""
         # Filter out system component alerts
         if self._should_ignore_alert(event.service_name):
             print(f"IGNORED: Skipping system component alert for {event.service_name}")
             return self._ignored_decision(event)
         
-        # Check for duplicate alerts (rate limiting)
+        # Check for duplicate alerts
         cache_key = f"{event.service_name}:{event.domain}"
         current_time = time.time()
         
@@ -91,7 +196,7 @@ class IncidentAgent:
             last_processed = self._alert_cache[cache_key]
             time_since = current_time - last_processed
             if time_since < self._cache_ttl:
-                print(f"RATE LIMIT: Skipping duplicate alert for {event.service_name} (processed {time_since:.0f}s ago, TTL={self._cache_ttl}s)")
+                print(f"RATE LIMIT: Skipping duplicate alert for {event.service_name} (processed {time_since:.0f}s ago)")
                 return self._cached_decision(event)
         
         # Update cache
@@ -101,43 +206,50 @@ class IncidentAgent:
         self._alert_cache = {k: v for k, v in self._alert_cache.items() 
                             if current_time - v < self._cache_ttl * 2}
         
-        print(f"PROCESSING: New alert for {event.service_name} (cache key: {cache_key})")
+        print(f"PROCESSING: New alert for {event.service_name}")
         
-        # 1. Build Context (Vector Search + MinIO Fetch)
+        # Extract namespace from metadata (convert protobuf map to dict)
+        metadata = dict(event.original_event.metadata) if event.original_event.metadata else {}
+        namespace = metadata.get("namespace", "default")
+        namespace = self._sanitize_input(namespace)
+        
+        # 1. Discover actual K8s resources (prevents wrong name guessing)
+        resources = self._discover_resources(namespace)
+        matching = self._find_matching_resources(event.service_name, resources)
+        
+        # 2. Build context from RAG
         context = self._build_context(event)
         
-        # 2. PHASE 1: Ask Gemini what diagnostics to run based on runbook
-        diagnostic_commands = self._get_diagnostic_commands(event, context)
+        # 3. Get diagnostic commands (with resource awareness)
+        diagnostic_commands = self._get_diagnostic_commands(event, context, namespace, resources, matching)
         
-        # 3. Execute approved diagnostic commands
-        diagnostics = self._run_diagnostics(event, diagnostic_commands)
+        # 4. Execute diagnostics
+        diagnostics = self._run_diagnostics(diagnostic_commands)
         
-        # 4. PHASE 2: Prompt Engineering for SRE behavior with diagnostic results
+        # 5. Build analysis prompt
         prompt = self._build_prompt(event, context, diagnostics)
         
         try:
-            # 5. Call Gemini for final analysis
-            response = self.model.generate_content(prompt)
-            print("RATE LIMIT: Sleeping 20s after analysis API call...")
-            time.sleep(20)
+            # 6. Call LLM for final analysis
+            response_text = self.llm.generate(prompt)
             
-            # 6. Parse Structured Output (JSON)
-            return self._parse_decision(response.text, event)
+            # 7. Parse decision
+            return self._parse_decision(response_text, event)
             
         except Exception as e:
-            print(f"Gemini generation failed: {e}")
+            print(f"LLM generation failed: {e}")
             return self._fallback_decision(event, str(e))
 
-    def _cached_decision(self, event):
+    def _cached_decision(self, event) -> orchestrator_pb2.Decision:
         """Return a cached/skipped decision for duplicate alerts."""
         decision = orchestrator_pb2.Decision()
         decision.decision_id = str(uuid.uuid4())
         decision.incident_id = event.event_id
-        decision.analysis = f"Alert for {event.service_name} was recently processed. Skipping to prevent API rate limiting."
-        decision.confidence_score = 0.0  # Indicates no analysis was performed
+        decision.analysis = f"Alert for {event.service_name} was recently processed. Skipping."
+        decision.confidence_score = 0.0
         return decision
 
-    def _ignored_decision(self, event):
+    def _ignored_decision(self, event) -> orchestrator_pb2.Decision:
         """Return a skip decision for ignored system component alerts."""
         decision = orchestrator_pb2.Decision()
         decision.decision_id = str(uuid.uuid4())
@@ -146,87 +258,107 @@ class IncidentAgent:
         decision.confidence_score = 0.0
         return decision
 
-    def _get_diagnostic_commands(self, event, context):
-        """PHASE 1: Ask Gemini to pick diagnostic commands from runbook."""
+    def _get_diagnostic_commands(self, event, context: str, namespace: str, 
+                                  resources: dict, matching: dict) -> list:
+        """
+        PHASE 1: Ask LLM to generate diagnostic commands.
+        Now includes actual resource names to prevent guessing.
+        """
+        service_name = self._sanitize_input(event.service_name)
+        raw_payload_str = str(event.original_event.raw_payload) if event.original_event.raw_payload else ""
+        raw_payload = self._sanitize_input(raw_payload_str[:1000])
         
-        # Debug: print the full metadata
-        print(f"DEBUG: event.original_event.metadata = {dict(event.original_event.metadata)}")
-        print(f"DEBUG: event.service_name = {event.service_name}")
+        # Build resource context for LLM
+        resource_context = f"""
+AVAILABLE RESOURCES IN NAMESPACE '{namespace}':
+- Pods: {matching.get('pods', [])[:10] or resources.get('pods', [])[:10]}
+- Deployments: {matching.get('deployments', [])[:5] or resources.get('deployments', [])[:5]}
+- All Pods (if needed): {resources.get('pods', [])[:15]}
+"""
         
-        namespace = event.original_event.metadata.get("namespace", "default")
-        pod_name = event.original_event.metadata.get("pod", "") or event.original_event.metadata.get("service", "") or event.service_name
-        
-        print(f"DEBUG: Extracted pod_name={pod_name}, namespace={namespace}")
-        
-        prompt = f"""You are an SRE assistant. Based on the runbook and alert, output ONLY the kubectl diagnostic commands to run.
-        
+        prompt = f"""You are an SRE assistant. Generate kubectl diagnostic commands for this alert.
+
 ALERT CONTEXT:
-Service: {event.service_name}
-Namespace: {namespace}
-Raw Alert: {event.original_event.raw_payload}
+- Service: {service_name}
+- Namespace: {namespace}
+- Alert: {raw_payload}
 
-RUNBOOK CONTENT:
-{context}
+{resource_context}
 
-INSTRUCTIONS:
-1. Suggest up to 5 read-only kubectl commands (get, describe, logs, top) to diagnose the issue.
-2. If the alert indicates a crash loop or missing pod, include commands to inspect the Deployment or ReplicaSet as well.
-3. Use the namespace '{namespace}' for all commands.
-4. Output valid JSON only.
+RUNBOOK GUIDANCE:
+{context[:2000]}
 
-OUTPUT SCHEMA:
+CRITICAL INSTRUCTIONS:
+1. Use EXACT resource names from the lists above - DO NOT guess or modify names
+2. Only use these command types: get, describe, logs, top
+3. Always include the namespace flag: -n {namespace}
+4. Suggest 3-5 diagnostic commands
+5. If a pod name looks like "myapp-abc123-xyz", use that EXACT name
+6. For logs, add --tail=100 to limit output
+
+OUTPUT FORMAT (valid JSON only):
 {{
     "commands": [
-        "kubectl describe pod {pod_name} -n {namespace}",
-        "kubectl logs deployment/{event.service_name} -n {namespace} --all-containers"
+        "kubectl describe pod EXACT_POD_NAME -n {namespace}",
+        "kubectl logs EXACT_POD_NAME -n {namespace} --tail=100"
     ]
 }}
 """
 
         try:
-            response = self.model.generate_content(prompt)
-            print("RATE LIMIT: Sleeping 20s after diagnostic API call...")
-            time.sleep(20)
-            
-            clean_json = response.text.replace("```json", "").replace("```", "").strip()
-            data = json.loads(clean_json)
+            response_text = self.llm.generate(prompt)
+            data = self._extract_json(response_text)
             commands = data.get("commands", [])
             
-            # Validate against whitelist
+            # Validate and filter commands
             validated = []
             for cmd in commands[:5]:
-                if any(cmd.strip().startswith(allowed) for allowed in self.ALLOWED_COMMANDS):
+                cmd = cmd.strip()
+                if any(cmd.startswith(allowed) for allowed in self.ALLOWED_COMMANDS):
                     validated.append(cmd)
-                    print(f"DIAGNOSTICS: Approved command: {cmd}")
+                    print(f"DIAGNOSTICS: Approved: {cmd}")
                 else:
-                    print(f"DIAGNOSTICS: BLOCKED command (not in whitelist): {cmd}")
+                    print(f"DIAGNOSTICS: BLOCKED (whitelist): {cmd}")
+            
+            # If no valid commands, generate safe fallbacks
+            if not validated:
+                validated = self._generate_fallback_commands(namespace, resources, matching)
             
             return validated
             
         except Exception as e:
-            print(f"DIAGNOSTICS: Failed to get commands from Gemini: {e}")
-            # Fallback
-            return [f"kubectl describe pod {pod_name} -n {namespace}"]
+            print(f"DIAGNOSTICS: LLM failed: {e}")
+            return self._generate_fallback_commands(namespace, resources, matching)
 
-    def _build_context(self, event):
+    def _generate_fallback_commands(self, namespace: str, resources: dict, matching: dict) -> list:
+        """Generate safe fallback diagnostic commands."""
+        commands = []
+        
+        # Try matching pods first
+        if matching.get("pods"):
+            pod = matching["pods"][0]
+            commands.append(f"kubectl describe pod {pod} -n {namespace}")
+            commands.append(f"kubectl logs {pod} -n {namespace} --tail=100")
+        # Fall back to any pods
+        elif resources.get("pods"):
+            pod = resources["pods"][0]
+            commands.append(f"kubectl describe pod {pod} -n {namespace}")
+        
+        # Always get recent events
+        commands.append(f"kubectl get events -n {namespace} --sort-by=.lastTimestamp | tail -20")
+        
+        print(f"DIAGNOSTICS: Using {len(commands)} fallback commands")
+        return commands[:5]
+
+    def _build_context(self, event) -> str:
+        """Build context from RAG (vector search + MinIO fetch)."""
         try:
-            # Create a search query from the event
-            query_text = f"{event.service_name} {event.original_event.raw_payload}"
+            raw_payload_str = str(event.original_event.raw_payload) if event.original_event.raw_payload else ""
+            query_text = f"{event.service_name} {raw_payload_str}"
             
-            # Embed the query
             print(f"RAG: Embedding query: {query_text[:50]}...")
-            result = genai.embed_content(
-                model="models/text-embedding-004",
-                content=query_text,
-                task_type="retrieval_query"
-            )
-            embedding = result['embedding']
+            embedding = self.llm.embed(query_text)
             
-            # Rate limit workaround
-            print("RATE LIMIT: Sleeping 20s after embedding API call...")
-            time.sleep(20)
-            
-            # Search Qdrant
             print("RAG: Searching Knowledge Base...")
             search_response = self.qdrant.query_points(
                 collection_name=self.collection_name,
@@ -240,11 +372,9 @@ OUTPUT SCHEMA:
             hit = search_response.points[0]
             print(f"RAG: Found runbook '{hit.payload.get('title')}' (Score: {hit.score})")
             
-            # Fetch content from MinIO
             filename = hit.payload.get('minio_path')
             bucket = hit.payload.get('minio_bucket', self.bucket_name)
             
-            print(f"RAG: Fetching content for {filename} from MinIO...")
             try:
                 response = self.minio_client.get_object(bucket, filename)
                 content = response.read().decode('utf-8')
@@ -255,62 +385,72 @@ OUTPUT SCHEMA:
                 return "Runbook found but failed to retrieve content."
             
             return f"""
-            RELEVANT RUNBOOK FOUND:
-            Title: {hit.payload.get('title')}
-            Content:
-            {content}
-            """
+RELEVANT RUNBOOK:
+Title: {hit.payload.get('title')}
+Content:
+{content[:3000]}
+"""
             
         except Exception as e:
             print(f"RAG Failed: {e}")
             return "Context retrieval failed."
 
-    def _resolve_pod_name(self, name, namespace):
-        """(Deprecated) Gemini should invoke correct commands directly."""
-        return name
-
-    def _run_diagnostics(self, event, commands):
-        """Execute kubectl commands chosen by Gemini (validated against whitelist)."""
+    def _run_diagnostics(self, commands: list) -> str:
+        """Execute kubectl commands with proper parsing and error handling."""
         diagnostics = []
         
         print(f"DIAGNOSTICS: Executing {len(commands)} commands...")
         
         for cmd in commands:
-            # Double-check whitelist
+            # Security re-check
             if not any(cmd.strip().startswith(allowed) for allowed in self.ALLOWED_COMMANDS):
                 print(f"DIAGNOSTICS: BLOCKED (security): {cmd}")
                 continue
             
-            # Directly use the command from Gemini (User Request: No replacements)
-            resolved_cmd = cmd
-            
             try:
-                print(f"DIAGNOSTICS: Running: {resolved_cmd}")
+                # Use shlex for proper shell-like parsing
+                # Handle pipes specially
+                if "|" in cmd:
+                    # For piped commands, use shell=True but only for safe commands
+                    result = subprocess.run(
+                        cmd,
+                        shell=True,
+                        capture_output=True, 
+                        text=True, 
+                        timeout=30
+                    )
+                else:
+                    # Parse command properly
+                    cmd_parts = shlex.split(cmd)
+                    result = subprocess.run(
+                        cmd_parts,
+                        capture_output=True, 
+                        text=True, 
+                        timeout=30
+                    )
                 
-                # Execute the command
-                result = subprocess.run(
-                    resolved_cmd.split(),
-                    capture_output=True, text=True, timeout=30
-                )
+                print(f"DIAGNOSTICS: Ran: {cmd[:80]}...")
                 
                 if result.returncode == 0 and result.stdout:
-                    # Truncate long output
-                    output = result.stdout[:3000] if len(result.stdout) > 3000 else result.stdout
-                    diagnostics.append(f"=== {resolved_cmd} ===\n{output}")
-                    
-                    # Log for visibility
-                    print(f"\n--- {resolved_cmd} ---")
-                    print(output[:1500])  # Log first 1500 chars
-                    print("--- end ---\n")
+                    output = result.stdout[:3000]
+                    diagnostics.append(f"=== {cmd} ===\n{output}")
                 elif result.stderr:
-                    diagnostics.append(f"=== {resolved_cmd} ===\nError: {result.stderr[:500]}")
-                    print(f"DIAGNOSTICS: Command failed: {result.stderr[:200]}")
+                    # Include error info - helpful for LLM analysis
+                    error_msg = result.stderr[:500]
+                    diagnostics.append(f"=== {cmd} ===\nCommand failed: {error_msg}")
+                    print(f"DIAGNOSTICS: Error: {error_msg[:100]}")
+                else:
+                    diagnostics.append(f"=== {cmd} ===\n(No output)")
                     
             except subprocess.TimeoutExpired:
-                diagnostics.append(f"=== {resolved_cmd} ===\nTimeout after 30s")
-                print(f"DIAGNOSTICS: Timeout: {resolved_cmd}")
+                diagnostics.append(f"=== {cmd} ===\nTimeout after 30s")
+                print(f"DIAGNOSTICS: Timeout: {cmd}")
+            except ValueError as e:
+                # shlex parsing error
+                print(f"DIAGNOSTICS: Parse error for '{cmd}': {e}")
+                diagnostics.append(f"=== {cmd} ===\nParse error: {e}")
             except Exception as e:
-                diagnostics.append(f"=== {resolved_cmd} ===\nFailed: {e}")
+                diagnostics.append(f"=== {cmd} ===\nFailed: {e}")
                 print(f"DIAGNOSTICS: Error: {e}")
         
         if not diagnostics:
@@ -318,74 +458,89 @@ OUTPUT SCHEMA:
         
         return "\n\n".join(diagnostics)
 
-    def _build_prompt(self, event, context, diagnostics=""):
-        return f"""
-        You are a Senior Site Reliability Engineer (SRE). 
-        Analyze the following incident and propose remediation actions.
-        
-        INCIDENT DETAILS:
-        ID: {event.event_id}
-        Service: {event.service_name}
-        Domain: {event.domain}
-        
-        CONTEXT (RUNBOOKS):
-        {context}
-        
-        LIVE DIAGNOSTIC OUTPUT (kubectl commands executed):
-        {diagnostics}
-        
-        RAW ALERT DATA:
-        {event.original_event.raw_payload}
+    def _build_prompt(self, event, context: str, diagnostics: str) -> str:
+        """Build the final analysis prompt."""
+        return f"""You are a Senior Site Reliability Engineer (SRE). 
+Analyze the following incident and propose remediation actions.
 
-        YOUR TASK:
-        1. Analyze the diagnostic output to identify the root cause.
-        2. Cross-reference with the runbook for remediation guidance.
-        3. Propose safe remediation actions.
-        
-        STRICT ACTION SCHEMA (YOU MUST FOLLOW THESE PARAMETERS):
-        - Action: "restart_pod"
-          Target: Pod Name (e.g., "kafka-ingest-123")
-          Params: {{ "namespace": "default" }}
-          
-        - Action: "scale_deployment"
-          Target: Deployment Name (e.g., "deployment/kafka-ingest")
-          Params: {{ "replicas": "integer_string" }} OR {{ "replicas_increment": "integer_string" }}
-          (DO NOT use 'replicas_increase', 'replicas_increase_by', or any other variation. ONLY 'replicas' or 'replicas_increment'.)
-          
-        - Action: "rolling_restart_deployment"
-          Target: Deployment Name (e.g., "deployment/kafka-ingest")
-          Params: {{ "namespace": "default" }}
+INCIDENT DETAILS:
+- ID: {event.event_id}
+- Service: {event.service_name}
+- Domain: {event.domain}
 
-        4. Provide a confidence score (0.0 to 1.0).
+RUNBOOK CONTEXT:
+{context}
 
-        OUTPUT FORMAT:
-        Return ONLY valid JSON matching this structure:
+LIVE DIAGNOSTIC OUTPUT:
+{diagnostics}
+
+RAW ALERT:
+{str(event.original_event.raw_payload) if event.original_event.raw_payload else 'N/A'}
+
+YOUR TASK:
+1. Analyze the diagnostic output to identify the root cause
+2. Cross-reference with the runbook for remediation guidance
+3. Propose safe, specific remediation actions
+
+AVAILABLE ACTIONS:
+- "restart_pod": Restart a specific pod
+  Target: exact pod name, Params: {{"namespace": "string"}}
+  
+- "scale_deployment": Scale a deployment
+  Target: deployment name, Params: {{"replicas": "int"}} OR {{"replicas_increment": "int"}}
+  
+- "rolling_restart_deployment": Restart all pods in deployment
+  Target: deployment name, Params: {{"namespace": "string"}}
+
+- "rollback_deployment": Rollback deployment to previous revision
+  Target: deployment name, Params: {{"namespace": "string"}}
+  Use when: bad deployment, recent code change caused issues, need to revert
+
+OUTPUT FORMAT (JSON only):
+{{
+    "analysis": "Brief explanation of root cause and findings",
+    "confidence_score": 0.0-1.0,
+    "proposed_actions": [
         {{
-            "analysis": "string explanation including diagnostic findings",
-            "confidence_score": float,
-            "proposed_actions": [
-                {{
-                    "action_type": "string",
-                    "target": "string (resource name)",
-                    "params": {{ "key": "value" }},
-                    "reasoning": "string"
-                }}
-            ]
+            "action_type": "restart_pod|scale_deployment|rolling_restart_deployment|rollback_deployment",
+            "target": "exact resource name",
+            "params": {{"key": "value"}},
+            "reasoning": "why this action helps"
         }}
-        """
+    ]
+}}
+"""
 
-    def _parse_decision(self, llm_output, event):
+    def _parse_decision(self, llm_output: str, event) -> orchestrator_pb2.Decision:
+        """Parse LLM output into Decision protobuf with retry on failure."""
         decision = orchestrator_pb2.Decision()
         decision.decision_id = str(uuid.uuid4())
         decision.incident_id = event.event_id
         
-        try:
-            # Clean markup if present
-            clean_json = llm_output.replace("```json", "").replace("```", "").strip()
-            data = json.loads(clean_json)
-            
-            decision.analysis = data.get("analysis", "No analysis provided")
-            decision.confidence_score = data.get("confidence_score", 0.0)
+        # Try to extract JSON
+        data = self._extract_json(llm_output)
+        
+        if not data:
+            # Retry with correction prompt if parse failed
+            print("PARSE: Initial extraction failed, attempting retry...")
+            try:
+                retry_prompt = f"""The following LLM output needs to be converted to valid JSON.
+Extract the analysis, confidence score, and proposed actions.
+
+Original output:
+{llm_output[:2000]}
+
+Return ONLY valid JSON in this format:
+{{"analysis": "...", "confidence_score": 0.5, "proposed_actions": []}}
+"""
+                retry_response = self.llm.generate(retry_prompt)
+                data = self._extract_json(retry_response)
+            except Exception as e:
+                print(f"PARSE: Retry failed: {e}")
+        
+        if data:
+            decision.analysis = data.get("analysis", "Analysis completed.")
+            decision.confidence_score = float(data.get("confidence_score", 0.5))
             
             for action_data in data.get("proposed_actions", []):
                 action = decision.proposed_actions.add()
@@ -395,18 +550,17 @@ OUTPUT SCHEMA:
                 action.target = action_data.get("target", "unknown")
                 action.reasoning = action_data.get("reasoning", "")
                 
-                # Handle params map
-                if "params" in action_data:
+                if "params" in action_data and isinstance(action_data["params"], dict):
                     for k, v in action_data["params"].items():
                         action.params[k] = str(v)
-                        
-        except Exception as e:
-            print(f"Failed to parse LLM JSON: {e}")
-            decision.analysis = f"Parse Error: {e}. Raw Output: {llm_output}"
+        else:
+            decision.analysis = f"Parse Error. Raw: {llm_output[:500]}"
+            decision.confidence_score = 0.0
             
         return decision
 
-    def _fallback_decision(self, event, error_msg):
+    def _fallback_decision(self, event, error_msg: str) -> orchestrator_pb2.Decision:
+        """Return a fallback decision when analysis fails."""
         decision = orchestrator_pb2.Decision()
         decision.decision_id = str(uuid.uuid4())
         decision.incident_id = event.event_id

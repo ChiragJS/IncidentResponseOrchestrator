@@ -1,6 +1,7 @@
 minio==7.2.0
 pypdf==3.17.4
-google-generativeai
+litellm>=1.40.0
+tenacity>=8.2.0
 confluent-kafka
 protobuf
 qdrant-client
